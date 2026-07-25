@@ -18,17 +18,22 @@ Or add to .claude/mcp.json:
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import sys
-from typing import Any
+from typing import Any, cast
+from urllib.parse import urlparse, urlunparse
 
+import httpx
 import mcp.types as types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-
 from miosa import AsyncMiosa, MiosaError
 from miosa.resources.computer import AsyncComputer
+from miosa.resources.sandboxes import AsyncSandbox
+
+from miosa_mcp.authority import authorize_mcp_tool
 from miosa_mcp.tools.egress import EGRESS_TOOLS, dispatch_egress
 
 logger = logging.getLogger("miosa-mcp")
@@ -38,6 +43,14 @@ logger = logging.getLogger("miosa-mcp")
 # ---------------------------------------------------------------------------
 
 MAX_CACHED = 50
+SANDBOX_SIZES = ("xs", "small", "medium", "large", "xl")
+SANDBOX_SHAPE_CONTRACTS = {
+    "xs": (1, 2_048, 10_240),
+    "small": (2, 4_096, 10_240),
+    "medium": (4, 8_192, 20_480),
+    "large": (8, 16_384, 40_960),
+    "xl": (16, 32_768, 81_920),
+}
 
 _computers: dict[str, AsyncComputer] = {}
 _last_computer_id: str | None = None
@@ -86,15 +99,55 @@ async def _resolve(client: AsyncMiosa, computer_id: str | None) -> AsyncComputer
 # Tool result helpers
 # ---------------------------------------------------------------------------
 
-def _ok(text: str) -> list[types.TextContent]:
+ToolContent = types.TextContent | types.ImageContent
+
+
+def _ok(text: str) -> list[ToolContent]:
     return [types.TextContent(type="text", text=text)]
 
 
-def _err(msg: str) -> list[types.TextContent]:
+def _err(msg: str) -> list[ToolContent]:
     return [types.TextContent(type="text", text=f"Error: {msg}")]
 
 
-def _image(png_bytes: bytes) -> list[types.ImageContent]:
+def _json_result(value: Any) -> list[ToolContent]:
+    return _ok(json.dumps(value, indent=2, default=str))
+
+
+def _unwrap(value: Any) -> Any:
+    if isinstance(value, dict) and "data" in value:
+        return value["data"]
+    return value
+
+
+def _error_result(tool: str, exc: Exception) -> types.CallToolResult:
+    error = {
+        "type": type(exc).__name__,
+        "code": getattr(exc, "code", None),
+        "message": str(exc),
+        "status": getattr(exc, "status_code", None),
+        "request_id": getattr(exc, "request_id", None),
+        "details": getattr(exc, "body", None),
+        "tool": tool,
+    }
+    payload = {"ok": False, "error": error}
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=json.dumps(payload, default=str))],
+        structuredContent=payload,
+        isError=True,
+    )
+
+
+def _set_tenant_context(client: AsyncMiosa, tenant: str | None) -> None:
+    """Apply tenant context to every SDK and raw transport request."""
+    headers = client._transport._client.headers
+    if tenant:
+        headers["X-MIOSA-Tenant"] = tenant
+    else:
+        headers.pop("X-MIOSA-Tenant", None)
+
+
+def _image(png_bytes: bytes) -> list[ToolContent]:
     return [
         types.ImageContent(
             type="image",
@@ -102,6 +155,78 @@ def _image(png_bytes: bytes) -> list[types.ImageContent]:
             mimeType="image/png",
         )
     ]
+
+
+def _public_probe_url(public_url: str, probe_path: str) -> str:
+    parsed = urlparse(public_url)
+    normalized_path = probe_path if probe_path.startswith("/") else f"/{probe_path}"
+    return urlunparse(parsed._replace(path=normalized_path, query="", fragment=""))
+
+
+def _looks_like_miosa_gateway_json(body: str) -> bool:
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return False
+    return (
+        isinstance(parsed, dict)
+        and parsed.get("ok") is True
+        and isinstance(parsed.get("run_id"), str)
+        and set(parsed.keys()) <= {"ok", "run_id"}
+    )
+
+
+def _add_doctor_check(
+    checks: list[dict[str, Any]],
+    name: str,
+    ok: bool,
+    message: str,
+    data: dict[str, Any] | None = None,
+) -> None:
+    check: dict[str, Any] = {"name": name, "ok": ok, "message": message}
+    if data is not None:
+        check["data"] = data
+    checks.append(check)
+
+
+def _resolve_sandbox_create_size(args: dict[str, Any]) -> str | None:
+    requested_size = args.get("size")
+    if requested_size is not None and requested_size not in SANDBOX_SIZES:
+        raise ValueError(
+            f"Unsupported sandbox size {requested_size!r}. "
+            f"Expected one of: {', '.join(SANDBOX_SIZES)}."
+        )
+
+    raw_keys = ("cpu_count", "memory_mb", "disk_size_mb")
+    supplied_keys = [key for key in raw_keys if args.get(key) is not None]
+    if not supplied_keys:
+        return cast(str | None, requested_size)
+    if len(supplied_keys) != len(raw_keys):
+        raise ValueError(
+            "Legacy raw sandbox resources require cpu_count, memory_mb, and "
+            "disk_size_mb together. Prefer size."
+        )
+
+    dimensions: list[int] = []
+    for key in raw_keys:
+        value = args[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{key} must be a positive integer.")
+        dimensions.append(value)
+
+    exact_shape = tuple(dimensions)
+    matching_size = next(
+        (size for size, shape in SANDBOX_SHAPE_CONTRACTS.items() if shape == exact_shape),
+        None,
+    )
+    if matching_size is None:
+        raise ValueError("Legacy raw sandbox resources must exactly match a named size contract.")
+    if requested_size is not None and requested_size != matching_size:
+        raise ValueError(
+            f"Legacy raw sandbox resources match {matching_size}, not requested size "
+            f"{requested_size}."
+        )
+    return matching_size
 
 
 # ---------------------------------------------------------------------------
@@ -115,14 +240,35 @@ MIOSA cloud infrastructure — Firecracker microVMs you control via API.
 - **Computer**: full Linux desktop VM (GUI, browser, apps). Use for visual tasks, browser automation, desktop control.
 - **Sandbox**: headless Linux VM. Use for code execution, builds, CI, scripts. No desktop.
 - **Deployment**: git-based app hosting with builds, releases, domains.
+- **Docker Deploy**: workspace appliance runtime for app containers. Prefer this when a user wants Docker-based app hosting or when the build was produced in a sandbox and should run as a container.
 - **Storage**: S3-compatible object storage (buckets + objects).
 - **Database**: managed Postgres, MySQL, or Redis.
 - **Volume**: persistent block storage, attachable to computers.
 
+## Docker Deploy agent sequence
+1. Use `docker_deploy_template_list`/`docker_deploy_template_get` when starting from a known app shape.
+2. Use `docker_deploy_host_ensure` before first publish in a workspace when the workspace id is known.
+3. For sandbox-built apps, use `sandbox_deploy_docker` instead of normal `sandbox_deploy`.
+4. After every Docker Deploy publish, call `docker_deploy_doctor` and only report success when `ok=true`.
+5. If doctor reports MIOSA gateway JSON, missing runtime metadata, or wrong `deployment_product`, treat the deployment as not live even if HTTP status is 200.
+
 ## Core workflows
+
+### Select an organization
+organization_list → organization_switch → organization_current
+
+The selected organization is propagated to every later request through
+`X-MIOSA-Tenant`. Use organization names in user-facing text and tenant only
+when referring to the underlying API header or identifier.
 
 ### Run code (sandbox)
 create_sandbox → exec (or exec_python) → read output → destroy_sandbox
+
+### Run an agent
+run_create → run_get → run_outputs/run_messages/run_files
+
+Runs are the canonical durable agent execution contract. Use `run_create`
+instead of legacy agent-run naming.
 
 ### Desktop automation (computer)
 computer_create → computer_screenshot → computer_click/type/key → computer_screenshot → repeat
@@ -158,6 +304,97 @@ def build_server(client: AsyncMiosa) -> Server:
     @app.list_tools()
     async def list_tools() -> list[types.Tool]:
         return [
+            # Organization context
+            types.Tool(
+                name="organization_list",
+                description="List organizations available to the authenticated user.",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            types.Tool(
+                name="organization_current",
+                description="Get the organization currently used for MCP requests.",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            types.Tool(
+                name="organization_switch",
+                description=(
+                    "Select an organization by ID or slug for every subsequent MCP request. "
+                    "The backend verifies membership before the context changes."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "organization": {
+                            "type": "string",
+                            "description": "Organization UUID or slug",
+                        }
+                    },
+                    "required": ["organization"],
+                },
+            ),
+            # Durable runs
+            types.Tool(
+                name="run_create",
+                description=(
+                    "Create a durable run for an agent or command on a Sandbox or Computer."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "instruction": {"type": "string"},
+                        "command": {"type": "string"},
+                        "target_kind": {"type": "string", "enum": ["sandbox", "computer"]},
+                        "target_id": {"type": "string"},
+                        "runner": {"type": "string"},
+                        "provider": {"type": "string"},
+                        "model": {"type": "string"},
+                        "cwd": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                        "wait": {"type": "boolean"},
+                        "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                        "agent_runtime_profile_id": {"type": "string"},
+                        "external_workspace_id": {"type": "string"},
+                        "external_user_id": {"type": "string"},
+                        "external_project_id": {"type": "string"},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": ["target_kind", "target_id"],
+                    "anyOf": [{"required": ["instruction"]}, {"required": ["command"]}],
+                },
+            ),
+            types.Tool(
+                name="run_list",
+                description="List durable runs in the current organization.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "target_kind": {"type": "string", "enum": ["sandbox", "computer"]},
+                        "target_id": {"type": "string"},
+                        "status": {"type": "string"},
+                        "external_workspace_id": {"type": "string"},
+                        "external_user_id": {"type": "string"},
+                        "external_project_id": {"type": "string"},
+                    },
+                },
+            ),
+            *[
+                types.Tool(
+                    name=tool_name,
+                    description=description,
+                    inputSchema={
+                        "type": "object",
+                        "properties": {"run_id": {"type": "string"}},
+                        "required": ["run_id"],
+                    },
+                )
+                for tool_name, description in (
+                    ("run_get", "Get a durable run."),
+                    ("run_cancel", "Cancel a durable run."),
+                    ("run_outputs", "Get structured outputs for a durable run."),
+                    ("run_messages", "Get messages emitted by a durable run."),
+                    ("run_files", "List files produced by a durable run."),
+                )
+            ],
             # Lifecycle
             types.Tool(
                 name="computer_create",
@@ -239,6 +476,32 @@ def build_server(client: AsyncMiosa) -> Server:
                         },
                     },
                     "required": ["computer_id"],
+                },
+            ),
+            types.Tool(
+                name="computer_viewer_password",
+                description="Show whether the raw external desktop viewer password is set. Authenticated platform desktop links do not need this password.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "computer_id": {
+                            "type": "string",
+                            "description": "Computer ID. Omit to use the active computer.",
+                        },
+                    },
+                },
+            ),
+            types.Tool(
+                name="computer_rotate_viewer_password",
+                description="Rotate and return the raw external desktop viewer password once for sharing a raw *.computer.miosa.ai link.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "computer_id": {
+                            "type": "string",
+                            "description": "Computer ID. Omit to use the active computer.",
+                        },
+                    },
                 },
             ),
             types.Tool(
@@ -1127,15 +1390,96 @@ def build_server(client: AsyncMiosa) -> Server:
             # ── Sandbox lifecycle ─────────────────────────────────────────
             types.Tool(
                 name="sandbox_create",
-                description="Create a new lightweight code sandbox (Firecracker microVM without desktop).",
+                description=(
+                    "Create a lightweight code sandbox using a canonical named size. "
+                    "Defaults to small (2 vCPU, 4 GB RAM, 10 GB disk)."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "name": {"type": "string", "description": "Human-readable name for the sandbox"},
                         "template_id": {"type": "string", "description": "Template / image ID (default: miosa-sandbox)"},
-                        "cpu_count": {"type": "integer", "description": "vCPU count"},
-                        "memory_mb": {"type": "integer", "description": "Memory in MB"},
-                        "timeout_sec": {"type": "integer", "description": "Idle timeout in seconds"},
+                        "size": {
+                            "type": "string",
+                            "enum": list(SANDBOX_SIZES),
+                            "default": "small",
+                            "description": "Canonical sandbox resource size",
+                        },
+                        "cpu_count": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "deprecated": True,
+                            "description": "Legacy compatibility; requires exact memory_mb and disk_size_mb",
+                        },
+                        "memory_mb": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "deprecated": True,
+                            "description": "Legacy compatibility; requires exact cpu_count and disk_size_mb",
+                        },
+                        "disk_size_mb": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "deprecated": True,
+                            "description": "Legacy compatibility; requires exact cpu_count and memory_mb",
+                        },
+                        "timeout_sec": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum wall-clock runtime in seconds",
+                        },
+                        "idle_timeout_sec": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Optional inactivity timeout in seconds",
+                        },
+                        "persistent": {
+                            "type": "boolean",
+                            "description": "Preserve sandbox state across stop/resume when supported",
+                        },
+                        "always_on": {
+                            "type": "boolean",
+                            "description": "Disable inactivity enforcement when policy allows it",
+                        },
+                        "allow_provision": {
+                            "type": "boolean",
+                            "description": "Allow the in-sandbox token to provision managed resources",
+                        },
+                        "env": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                            "description": "Environment variables injected at boot",
+                        },
+                        "region": {"type": "string", "description": "Requested MIOSA region"},
+                        "workspace_id": {"type": "string", "description": "MIOSA workspace ID"},
+                        "workspace_slug": {"type": "string", "description": "MIOSA workspace slug"},
+                        "workspace_name": {
+                            "type": "string",
+                            "description": "Workspace name used when external attribution creates it",
+                        },
+                        "project_id": {"type": "string", "description": "MIOSA project ID"},
+                        "project_slug": {"type": "string", "description": "MIOSA project slug"},
+                        "project_name": {
+                            "type": "string",
+                            "description": "Project name used when external attribution creates it",
+                        },
+                        "external_workspace_id": {
+                            "type": "string",
+                            "description": "Caller workspace or customer ID for attribution",
+                        },
+                        "external_user_id": {
+                            "type": "string",
+                            "description": "Caller user ID for attribution",
+                        },
+                        "external_project_id": {
+                            "type": "string",
+                            "description": "Caller project ID for attribution",
+                        },
+                    },
+                    "dependentRequired": {
+                        "cpu_count": ["memory_mb", "disk_size_mb"],
+                        "memory_mb": ["cpu_count", "disk_size_mb"],
+                        "disk_size_mb": ["cpu_count", "memory_mb"],
                     },
                 },
             ),
@@ -1349,7 +1693,7 @@ def build_server(client: AsyncMiosa) -> Server:
             # ── Sandbox deploy ────────────────────────────────────────────
             types.Tool(
                 name="sandbox_deploy",
-                description="Deploy sandbox contents to production.",
+                description="Deploy sandbox contents to production through MIOSA.",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -1357,15 +1701,79 @@ def build_server(client: AsyncMiosa) -> Server:
                         "name": {"type": "string", "description": "Deployment name (optional)"},
                         "output_path": {"type": "string", "description": "Path inside the sandbox to deploy (optional)"},
                         "entrypoint": {"type": "string", "description": "Entrypoint command or file (optional)"},
+                        "port": {"type": "integer", "description": "App port inside the sandbox (optional)"},
+                        "deployment_type": {"type": "string", "description": "Set to docker_deploy to use Docker Deploy"},
                         "domain": {"type": "string", "description": "Custom domain (optional)"},
                     },
                     "required": ["sandbox_id"],
                 },
             ),
+            types.Tool(
+                name="sandbox_deploy_docker",
+                description="Deploy sandbox contents through the workspace Docker Deploy runtime. Uses MIOSA native APIs, not an external deploy MCP.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "sandbox_id": {"type": "string", "description": "Sandbox ID"},
+                        "name": {"type": "string", "description": "Deployment name"},
+                        "output_path": {"type": "string", "description": "Path inside the sandbox to deploy (optional)"},
+                        "entrypoint": {"type": "string", "description": "Entrypoint command or file (optional)"},
+                        "port": {"type": "integer", "description": "App port inside the sandbox"},
+                        "docker_deploy_template_id": {
+                            "type": "string",
+                            "description": "Docker Deploy template ID used to build/generate the app (optional)",
+                        },
+                        "domain": {"type": "string", "description": "Custom domain (optional)"},
+                    },
+                    "required": ["sandbox_id"],
+                },
+            ),
+            # ── Product templates ─────────────────────────────────────────
+            types.Tool(
+                name="product_template_list",
+                description="List canonical product templates across sandbox, computer, and Docker Deploy appliance products.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "product": {
+                            "type": "string",
+                            "description": "Optional product filter: sandbox, computer, docker_deploy_host",
+                        }
+                    },
+                },
+            ),
+            types.Tool(
+                name="product_template_get",
+                description="Get one canonical product template, including size readiness and benchmark lane metadata.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "template_id": {
+                            "type": "string",
+                            "description": "Canonical template ID, e.g. miosa-sandbox, nextjs, miosa-desktop",
+                        }
+                    },
+                    "required": ["template_id"],
+                },
+            ),
+            types.Tool(
+                name="product_template_readiness",
+                description="Show size readiness for one canonical product template.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "template_id": {
+                            "type": "string",
+                            "description": "Canonical template ID, e.g. miosa-sandbox, nextjs, miosa-desktop",
+                        }
+                    },
+                    "required": ["template_id"],
+                },
+            ),
             # ── Sandbox templates ─────────────────────────────────────────
             types.Tool(
                 name="sandbox_template_list",
-                description="List available sandbox templates.",
+                description="List tenant-owned sandbox templates for custom sandbox environments. For canonical product/template/size readiness, use product_template_list.",
                 inputSchema={"type": "object", "properties": {}},
             ),
             types.Tool(
@@ -1406,12 +1814,146 @@ def build_server(client: AsyncMiosa) -> Server:
                     "type": "object",
                     "properties": {
                         "name": {"type": "string", "description": "Deployment name"},
-                        "type": {"type": "string", "description": "Deployment type (e.g. web, worker)"},
-                        "source": {"type": "object", "description": "Source configuration"},
-                        "env_vars": {"type": "object", "description": "Environment variables as key-value pairs"},
-                        "region": {"type": "string", "description": "Deployment region (optional)"},
+                        "repo_url": {"type": "string", "description": "Git repository URL"},
+                        "branch": {"type": "string", "description": "Git branch"},
+                        "build_command": {"type": "string", "description": "Build command"},
+                        "run_command": {"type": "string", "description": "Run command"},
+                        "deployment_product": {"type": "string", "description": "Set to docker_deploy for Docker Deploy"},
+                        "external_workspace_id": {"type": "string", "description": "Caller workspace/customer id"},
+                        "external_user_id": {"type": "string", "description": "Caller user id"},
+                        "external_project_id": {"type": "string", "description": "Caller project id"},
                     },
                     "required": ["name"],
+                },
+            ),
+            types.Tool(
+                name="docker_deploy_create",
+                description="Create a git-backed Docker Deploy deployment on the workspace's dedicated MIOSA runtime host.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Deployment name"},
+                        "repo_url": {"type": "string", "description": "Git repository URL"},
+                        "branch": {"type": "string", "description": "Git branch"},
+                        "build_command": {"type": "string", "description": "Build command"},
+                        "run_command": {"type": "string", "description": "Run command"},
+                        "docker_deploy_template_id": {
+                            "type": "string",
+                            "description": "Docker Deploy template ID used to build/generate the app (optional)",
+                        },
+                        "external_workspace_id": {"type": "string", "description": "Caller workspace/customer id"},
+                        "external_user_id": {"type": "string", "description": "Caller user id"},
+                        "external_project_id": {"type": "string", "description": "Caller project id"},
+                    },
+                    "required": ["name"],
+                },
+            ),
+            types.Tool(
+                name="docker_deploy_template_list",
+                description="List Docker Deploy app templates for generated sites, apps, APIs, workers, and compose stacks.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string", "description": "Optional category filter"},
+                        "runtime": {"type": "string", "description": "Optional runtime filter"},
+                        "framework": {"type": "string", "description": "Optional framework filter"},
+                        "include_preview": {
+                            "type": "boolean",
+                            "description": "Include preview file content when supported",
+                        },
+                    },
+                },
+            ),
+            types.Tool(
+                name="docker_deploy_template_get",
+                description="Get one Docker Deploy app template.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "template_id": {
+                            "type": "string",
+                            "description": "Docker Deploy template ID",
+                        },
+                    },
+                    "required": ["template_id"],
+                },
+            ),
+            types.Tool(
+                name="docker_deploy_host_list",
+                description="List workspace Docker Deploy appliance hosts.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "workspace_id": {
+                            "type": "string",
+                            "description": "MIOSA workspace UUID filter (optional)",
+                        },
+                    },
+                },
+            ),
+            types.Tool(
+                name="docker_deploy_host_ensure",
+                description="Create or return the dedicated Docker Deploy appliance host for a workspace.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "workspace_id": {
+                            "type": "string",
+                            "description": "MIOSA workspace UUID",
+                        },
+                        "region": {"type": "string", "description": "Host region (optional)"},
+                        "size": {"type": "string", "description": "Host size (optional)"},
+                        "appliance_image": {
+                            "type": "string",
+                            "description": "Private MIOSA Docker Deploy appliance image (optional)",
+                        },
+                        "metadata": {"type": "object", "description": "Additional host metadata"},
+                    },
+                    "required": ["workspace_id"],
+                },
+            ),
+            types.Tool(
+                name="docker_deploy_host_get",
+                description="Get one Docker Deploy appliance host.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "host_id": {
+                            "type": "string",
+                            "description": "Docker Deploy host ID",
+                        },
+                    },
+                    "required": ["host_id"],
+                },
+            ),
+            types.Tool(
+                name="docker_deploy_doctor",
+                description=(
+                    "Verify a Docker Deploy deployment end-to-end: product marker, "
+                    "appliance host, route runtime metadata, and optional public URL probe. "
+                    "Call this after sandbox_deploy_docker before reporting the app is live."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "deployment_id": {
+                            "type": "string",
+                            "description": "Deployment ID to verify",
+                        },
+                        "probe": {
+                            "type": "boolean",
+                            "description": "Probe the public URL (default true)",
+                        },
+                        "probe_path": {
+                            "type": "string",
+                            "description": "Path to probe on the public URL (default /)",
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Public URL probe timeout in seconds (default 20)",
+                        },
+                    },
+                    "required": ["deployment_id"],
                 },
             ),
             types.Tool(
@@ -1559,8 +2101,8 @@ def build_server(client: AsyncMiosa) -> Server:
                     "properties": {
                         "bucket_id": {"type": "string", "description": "Bucket ID or name"},
                         "key": {"type": "string", "description": "Object key (path within bucket)"},
-                        "content": {"type": "string", "description": "Object content (text or base64-encoded binary)"},
-                        "content_type": {"type": "string", "description": "MIME type of the object (optional)"},
+                        "content": {"type": "string", "description": "Object content. Plain text by default; base64-encoded bytes when content_encoding='base64'."},
+                        "content_encoding": {"type": "string", "enum": ["utf-8", "base64"], "description": "How 'content' is encoded (default: utf-8). Use 'base64' for binary payloads.", "default": "utf-8"},
                     },
                     "required": ["bucket_id", "key", "content"],
                 },
@@ -2285,18 +2827,19 @@ def build_server(client: AsyncMiosa) -> Server:
     @app.call_tool()
     async def call_tool(
         name: str, arguments: dict[str, Any]
-    ) -> list[types.TextContent | types.ImageContent]:
+    ) -> list[types.TextContent | types.ImageContent] | types.CallToolResult:
         try:
+            await authorize_mcp_tool(client._transport, name, arguments)
             return await _dispatch(client, name, arguments)
         except MiosaError as exc:
             logger.error("MIOSA API error in tool %s: %s", name, exc)
-            return _err(str(exc))
+            return _error_result(name, exc)
         except ValueError as exc:
             logger.warning("Bad arguments for tool %s: %s", name, exc)
-            return _err(str(exc))
+            return _error_result(name, exc)
         except Exception as exc:
             logger.exception("Unexpected error in tool %s", name)
-            return _err(f"Unexpected error: {exc}")
+            return _error_result(name, exc)
 
     return app
 
@@ -2310,6 +2853,96 @@ async def _dispatch(
 
     global _last_computer_id
     cid: str | None = args.get("computer_id") or None
+
+    # Organization context
+    if name == "organization_list":
+        raw = await client._transport.request("GET", "/api/v1/platform/tenants")
+        return _json_result({"organizations": _unwrap(raw) or []})
+
+    if name == "organization_current":
+        raw = await client._transport.request("GET", "/api/v1/platform/tenants/current")
+        return _json_result({"organization": _unwrap(raw)})
+
+    if name == "organization_switch":
+        organization = str(args["organization"]).strip()
+        if not organization:
+            raise ValueError("organization must not be empty")
+        raw = await client._transport.request(
+            "GET",
+            "/api/v1/platform/tenants/current",
+            headers={"X-MIOSA-Tenant": organization},
+        )
+        selected = _unwrap(raw)
+        _set_tenant_context(client, organization)
+        _computers.clear()
+        _last_computer_id = None
+        return _json_result({"organization": selected, "tenant_context": organization})
+
+    # Durable runs
+    if name == "run_create":
+        target_kind = args["target_kind"]
+        target_id = args["target_id"]
+        run_body = {
+            key: args[key]
+            for key in (
+                "instruction",
+                "command",
+                "target_kind",
+                "target_id",
+                "runner",
+                "provider",
+                "model",
+                "cwd",
+                "timeout",
+                "wait",
+                "env",
+                "agent_runtime_profile_id",
+                "external_workspace_id",
+                "external_user_id",
+                "external_project_id",
+                "metadata",
+            )
+            if args.get(key) is not None
+        }
+        run_body[f"{target_kind}_id"] = target_id
+        raw = await client._transport.request(
+            "POST", "/api/v1/runs", json_body=run_body
+        )
+        return _json_result(_unwrap(raw))
+
+    if name == "run_list":
+        run_params = {
+            key: args[key]
+            for key in (
+                "target_kind",
+                "target_id",
+                "status",
+                "external_workspace_id",
+                "external_user_id",
+                "external_project_id",
+            )
+            if args.get(key) is not None
+        }
+        raw = await client._transport.request(
+            "GET", "/api/v1/runs", params=run_params or None
+        )
+        return _json_result({"runs": _unwrap(raw) or []})
+
+    run_paths = {
+        "run_get": ("GET", ""),
+        "run_cancel": ("POST", "/cancel"),
+        "run_outputs": ("GET", "/outputs"),
+        "run_messages": ("GET", "/messages"),
+        "run_files": ("GET", "/files"),
+    }
+    if name in run_paths:
+        method, suffix = run_paths[name]
+        path = f"/api/v1/runs/{args['run_id']}{suffix}"
+        if method == "POST":
+            raw = await client._transport.request(method, path, json_body={})
+        else:
+            raw = await client._transport.request(method, path)
+        return _json_result(_unwrap(raw))
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -2362,6 +2995,39 @@ async def _dispatch(
         _set_active(computer)
         return _ok(
             f"id={computer.id}  name={computer.name!r}  status={computer.status}"
+        )
+
+    if name == "computer_viewer_password":
+        computer = await _resolve(client, cid)
+        raw = await client._transport.request(
+            "GET",
+            f"/api/v1/computers/{computer.id}/viewer-password",
+        )
+        data = _unwrap(raw)
+        set_at = data.get("viewer_password_set_at") or data.get("password_set_at")
+        return _ok(
+            "External desktop viewer password:\n"
+            f"  computer={computer.id}\n"
+            f"  password_set={bool(data.get('viewer_password_set') or data.get('password_set'))}\n"
+            f"  set_at={set_at or '-'}\n"
+            "Authenticated platform desktop links do not need this password."
+        )
+
+    if name == "computer_rotate_viewer_password":
+        computer = await _resolve(client, cid)
+        raw = await client._transport.request(
+            "POST",
+            f"/api/v1/computers/{computer.id}/viewer-password/rotate",
+            json_body={},
+        )
+        data = _unwrap(raw)
+        password = data.get("viewer_password") or data.get("password")
+        if not password:
+            return _err("Viewer password was rotated but no plaintext password was returned.")
+        return _ok(
+            "Rotated external desktop viewer password:\n"
+            f"  computer={computer.id}\n"
+            f"  viewer_password={password}"
         )
 
     if name == "computer_start":
@@ -2650,7 +3316,8 @@ async def _dispatch(
             return _ok(f"No files found at {path or '/'}.")
         lines = [f"Files at {path or '/'}:"]
         for e in entries:
-            lines.append(f"  {e.name}  {e.type}  {e.size}")
+            kind = "directory" if e.is_dir else "file"
+            lines.append(f"  {e.name}  {kind}  {e.size}")
         return _ok("\n".join(lines))
 
     if name == "computer_stat_file":
@@ -2658,10 +3325,10 @@ async def _dispatch(
         stat = await computer.files.stat(args["path"])
         lines = [
             f"path: {args['path']}",
-            f"type: {stat.type}",
+            f"type: {'directory' if stat.is_dir else 'file'}",
             f"size: {stat.size}",
             f"mode: {stat.mode}",
-            f"mtime: {stat.mtime}",
+            f"mtime: {stat.modified_at}",
         ]
         return _ok("\n".join(lines))
 
@@ -2769,12 +3436,12 @@ async def _dispatch(
 
     if name == "computer_service_logs":
         computer = await _resolve(client, cid)
-        lines: list[str] = []
+        service_lines: list[str] = []
         async for event in computer.services.logs(args["service_id"], follow=False):
-            lines.append(f"[{event.stream}] {event.line}")
-            if len(lines) >= 100:
+            service_lines.append(f"[{event.stream}] {event.line}")
+            if len(service_lines) >= 100:
                 break
-        return _ok("\n".join(lines) if lines else "No log output.")
+        return _ok("\n".join(service_lines) if service_lines else "No log output.")
 
     if name == "computer_service_delete":
         computer = await _resolve(client, cid)
@@ -2815,7 +3482,11 @@ async def _dispatch(
         if isinstance(result, dict):
             log_lines = result.get("lines") or result.get("data") or result.get("logs") or []
             if isinstance(log_lines, list):
-                return _ok("\n".join(str(l) for l in log_lines) if log_lines else "No logs.")
+                return _ok(
+                    "\n".join(str(line) for line in log_lines)
+                    if log_lines
+                    else "No logs."
+                )
             return _ok(str(log_lines))
         return _ok(str(result))
 
@@ -2857,21 +3528,35 @@ async def _dispatch(
 
     if name == "sandbox_create":
         body: dict[str, Any] = {}
+        resolved_size = _resolve_sandbox_create_size(args)
+        if resolved_size is not None:
+            body["size"] = resolved_size
         if args.get("name"):
             body["name"] = args["name"]
         if args.get("template_id"):
             body["template_id"] = args["template_id"]
-        if args.get("cpu_count") is not None:
-            body["cpu_count"] = int(args["cpu_count"])
-        if args.get("memory_mb") is not None:
-            body["memory_mb"] = int(args["memory_mb"])
-        if args.get("timeout_sec") is not None:
-            body["timeout_sec"] = int(args["timeout_sec"])
+        for key in (
+            "timeout_sec",
+            "idle_timeout_sec",
+            "persistent",
+            "always_on",
+            "allow_provision",
+            "env",
+            "region",
+            "workspace_id",
+            "workspace_slug",
+            "workspace_name",
+            "project_id",
+            "project_slug",
+            "project_name",
+            "external_workspace_id",
+            "external_user_id",
+            "external_project_id",
+        ):
+            if args.get(key) is not None:
+                body[key] = args[key]
         sandbox = await client.sandboxes.create(**body)
-        return _ok(
-            f"Created sandbox '{sandbox.data.get('name', sandbox.id)}' "
-            f"(id={sandbox.id}, state={sandbox.state})."
-        )
+        return _json_result({"sandbox": sandbox.data})
 
     if name == "sandbox_list":
         state_filter = args.get("state") or None
@@ -2889,20 +3574,7 @@ async def _dispatch(
     if name == "sandbox_get":
         sid = args["sandbox_id"]
         sandbox = await client.sandboxes.get(sid)
-        d = sandbox.data
-        lines = [
-            f"id: {sandbox.id}",
-            f"state: {sandbox.state}",
-            f"template_id: {sandbox.template_id}",
-            f"ready: {sandbox.ready}",
-        ]
-        if d.get("name"):
-            lines.insert(1, f"name: {d['name']}")
-        if sandbox.preview_url:
-            lines.append(f"preview_url: {sandbox.preview_url}")
-        if sandbox.boot_ms is not None:
-            lines.append(f"boot_ms: {sandbox.boot_ms}")
-        return _ok("\n".join(lines))
+        return _json_result({"sandbox": sandbox.data})
 
     if name == "sandbox_destroy":
         sid = args["sandbox_id"]
@@ -3046,22 +3718,84 @@ async def _dispatch(
         sandbox = await client.sandboxes.get(sid)
         port = args.get("port")
         url = await sandbox.expose(port=int(port) if port is not None else None)
-        return _ok(f"Preview URL: {url}")
+        return _json_result(
+            {
+                "sandbox_id": sid,
+                "url": url,
+                "preview_url": url,
+                "external_workspace_id": sandbox.data.get("external_workspace_id"),
+                "external_user_id": sandbox.data.get("external_user_id"),
+                "external_project_id": sandbox.data.get("external_project_id"),
+            }
+        )
 
     # ── Sandbox deploy ─────────────────────────────────────────────────────
 
-    if name == "sandbox_deploy":
+    if name in {"sandbox_deploy", "sandbox_deploy_docker"}:
         sid = args["sandbox_id"]
-        sandbox = await client.sandboxes.get(sid)
-        deploy_result = await sandbox.deploy(
-            name=args.get("name") or None,
-            output_path=args.get("output_path") or None,
-            entrypoint=args.get("entrypoint") or None,
-            domain=args.get("domain") or None,
+        deployment_type = args.get("deployment_type")
+        if name == "sandbox_deploy_docker":
+            deployment_type = "docker_deploy"
+            body = {
+                key: value
+                for key, value in {
+                    "name": args.get("name") or None,
+                    "output_path": args.get("output_path") or None,
+                    "entrypoint": args.get("entrypoint") or None,
+                    "port": args.get("port") or None,
+                    "deployment_type": deployment_type,
+                    "docker_deploy_template_id": args.get("docker_deploy_template_id") or None,
+                    "domain": args.get("domain") or None,
+                }.items()
+                if value is not None
+            }
+            raw_deploy_result = await client._transport.request(
+                "POST",
+                f"/api/v1/sandboxes/{sid}/deploy",
+                json_body=body,
+            )
+            deploy_result = (
+                raw_deploy_result["data"]
+                if isinstance(raw_deploy_result, dict) and "data" in raw_deploy_result
+                else raw_deploy_result
+            )
+        else:
+            sandbox = await client.sandboxes.get(sid)
+            deploy_result = await sandbox.deploy(
+                name=args.get("name") or None,
+                output_path=args.get("output_path") or None,
+                entrypoint=args.get("entrypoint") or None,
+                port=args.get("port") or None,
+                deployment_type=deployment_type,
+                domain=args.get("domain") or None,
+            )
+        url = (
+            deploy_result.get("public_url")
+            or deploy_result.get("url")
+            or deploy_result.get("preview_url")
+            or ""
         )
-        url = deploy_result.get("url") or deploy_result.get("preview_url") or ""
         did = deploy_result.get("id") or deploy_result.get("deployment_id") or "unknown"
-        return _ok(f"Deployed sandbox {sid} (deployment id={did}, url={url}).")
+        nested = deploy_result.get("data") or {}
+        nested_deployment = nested.get("deployment") if isinstance(nested, dict) else {}
+        attribution = {
+            key: nested_deployment.get(key) or deploy_result.get(key)
+            for key in (
+                "external_workspace_id",
+                "external_user_id",
+                "external_project_id",
+            )
+        } if isinstance(nested_deployment, dict) else {}
+        return _json_result(
+            {
+                "sandbox_id": sid,
+                "deployment_id": did,
+                "url": url,
+                "public_url": url,
+                "attribution": attribution,
+                "deployment": deploy_result,
+            }
+        )
 
     # ── Sandbox templates ──────────────────────────────────────────────────
 
@@ -3106,40 +3840,308 @@ async def _dispatch(
 
     # ── Deployments ────────────────────────────────────────────────────────
 
-    def _unwrap(raw: Any) -> Any:
-        """Unwrap { data: ... } envelope if present."""
-        if isinstance(raw, dict) and "data" in raw:
-            return raw["data"]
-        return raw
+    def _product_templates(raw: Any) -> list[dict[str, Any]]:
+        catalog = _unwrap(raw)
+        if isinstance(catalog, dict):
+            templates = catalog.get("templates") or catalog.get("items") or []
+            return [t for t in templates if isinstance(t, dict)]
+        if isinstance(catalog, list):
+            return [t for t in catalog if isinstance(t, dict)]
+        return []
+
+    def _format_product_template(template: dict[str, Any]) -> str:
+        sizes = template.get("sizes")
+        if isinstance(sizes, list):
+            size_text = ", ".join(
+                f"{s.get('size', '?')}:{s.get('state', 'unknown')}"
+                for s in sizes
+                if isinstance(s, dict)
+            )
+        else:
+            size_text = "-"
+        return (
+            f"{template.get('id')} product={template.get('product', '-')} "
+            f"default_size={template.get('default_size', '-')} "
+            f"sdk={template.get('sdk_name', '-')} cli={template.get('cli_name', '-')} "
+            f"sizes={size_text}"
+        )
+
+    if name in {"product_template_list", "product_template_get", "product_template_readiness"}:
+        raw = await client._transport.request("GET", "/api/v1/templates")
+        templates = _product_templates(raw)
+
+        if name == "product_template_list":
+            product = args.get("product")
+            if product:
+                templates = [t for t in templates if t.get("product") == product]
+            if not templates:
+                return _ok("No product templates found.")
+            lines = ["Product templates:"]
+            lines.extend(f"  {_format_product_template(t)}" for t in templates)
+            return _ok("\n".join(lines))
+
+        template_id = args["template_id"]
+        template = next((t for t in templates if t.get("id") == template_id), None)
+        if not template:
+            return _err(f"Product template not found: {template_id}")
+
+        if name == "product_template_readiness":
+            sizes = template.get("sizes")
+            if not isinstance(sizes, list) or not sizes:
+                return _ok(f"No readiness rows found for {template_id}.")
+            lines = [f"Readiness for {template_id}:"]
+            for row in sizes:
+                if isinstance(row, dict):
+                    nodes = (
+                        f"{row.get('ready_nodes', 0)}/{row.get('checked_nodes')}"
+                        if row.get("checked_nodes") is not None
+                        else "-"
+                    )
+                    lines.append(
+                        f"  {row.get('size', '?')}  {row.get('state', 'unknown')}  nodes={nodes}"
+                    )
+            return _ok("\n".join(lines))
+
+        return _ok("Product template:\n  " + _format_product_template(template))
 
     if name == "deployment_list":
         raw = await client._transport.request("GET", "/api/v1/deployments")
         deployments = _unwrap(raw)
-        if not deployments:
-            return _ok("No deployments found.")
-        lines = ["Deployments:"]
-        for d in deployments:
-            lines.append(f"  {d.get('id')}  {d.get('name')}  {d.get('status', d.get('state', ''))}")
-        return _ok("\n".join(lines))
+        return _json_result({"deployments": deployments or []})
 
     if name == "deployment_get":
         did = args["deployment_id"]
         raw = await client._transport.request("GET", f"/api/v1/deployments/{did}")
-        return _ok(str(raw))
+        return _json_result({"deployment": _unwrap(raw)})
 
-    if name == "deployment_create":
-        body: dict[str, Any] = {"name": args["name"]}
-        if args.get("type"):
-            body["type"] = args["type"]
-        if args.get("source"):
-            body["source"] = args["source"]
-        if args.get("env_vars"):
-            body["env_vars"] = args["env_vars"]
-        if args.get("region"):
-            body["region"] = args["region"]
-        raw = await client._transport.request("POST", "/api/v1/deployments", json_body=body)
+    if name in {"deployment_create", "docker_deploy_create"}:
+        deployment_body: dict[str, Any] = {"name": args["name"]}
+        for key in (
+            "repo_url",
+            "branch",
+            "build_command",
+            "run_command",
+            "workspace_id",
+            "external_workspace_id",
+            "external_project_id",
+            "external_user_id",
+            "docker_deploy_template_id",
+        ):
+            if args.get(key) is not None:
+                deployment_body[key] = args[key]
+        metadata = dict(args.get("metadata") or {})
+        if name == "docker_deploy_create" or args.get("deployment_product") == "docker_deploy":
+            metadata["deployment_product"] = "docker_deploy"
+        if metadata:
+            deployment_body["metadata"] = metadata
+        raw = await client._transport.request(
+            "POST", "/api/v1/deployments", json_body=deployment_body
+        )
         d = _unwrap(raw)
-        return _ok(f"Created deployment '{d.get('name', args['name'])}' (id={d.get('id')})")
+        return _json_result({"deployment": d})
+
+    if name == "docker_deploy_template_list":
+        params = {
+            key: args[key]
+            for key in ("category", "runtime", "framework", "include_preview")
+            if args.get(key) is not None
+        }
+        raw = await client._transport.request(
+            "GET", "/api/v1/docker-deploy/templates", params=params or None
+        )
+        templates = _unwrap(raw)
+        if isinstance(templates, dict):
+            templates = templates.get("templates") or templates.get("items") or templates.get("data") or []
+        return _ok(json.dumps(templates, indent=2))
+
+    if name == "docker_deploy_template_get":
+        template_id = args["template_id"]
+        raw = await client._transport.request(
+            "GET", f"/api/v1/docker-deploy/templates/{template_id}"
+        )
+        return _ok(json.dumps(_unwrap(raw), indent=2))
+
+    if name == "docker_deploy_host_list":
+        params = {"workspace_id": args["workspace_id"]} if args.get("workspace_id") else None
+        raw = await client._transport.request(
+            "GET", "/api/v1/docker-deploy/hosts", params=params
+        )
+        return _ok(json.dumps(_unwrap(raw), indent=2))
+
+    if name == "docker_deploy_host_ensure":
+        ensure_body = {
+            key: args[key]
+            for key in ("workspace_id", "region", "size", "appliance_image", "metadata")
+            if args.get(key) is not None
+        }
+        raw = await client._transport.request(
+            "POST", "/api/v1/docker-deploy/hosts/ensure", json_body=ensure_body
+        )
+        ensured_host = _unwrap(raw)
+        return _ok(json.dumps(ensured_host, indent=2))
+
+    if name == "docker_deploy_host_get":
+        host_id = args["host_id"]
+        raw = await client._transport.request(
+            "GET", f"/api/v1/docker-deploy/hosts/{host_id}"
+        )
+        return _ok(json.dumps(_unwrap(raw), indent=2))
+
+    if name == "docker_deploy_doctor":
+        deployment_id = args["deployment_id"]
+        checks: list[dict[str, Any]] = []
+        raw = await client._transport.request(
+            "GET", f"/api/v1/deployments/{deployment_id}"
+        )
+        deployment = _unwrap(raw)
+        if not isinstance(deployment, dict):
+            return _err(f"Deployment {deployment_id} did not return an object.")
+
+        metadata_value = deployment.get("metadata")
+        doctor_metadata: dict[str, Any] = (
+            metadata_value if isinstance(metadata_value, dict) else {}
+        )
+        product = deployment.get("deployment_product") or doctor_metadata.get(
+            "deployment_product"
+        )
+        host_id = deployment.get("docker_deploy_host_id") or doctor_metadata.get(
+            "docker_deploy_host_id"
+        )
+        _add_doctor_check(
+            checks,
+            "deployment_product",
+            product == "docker_deploy",
+            "Deployment is marked as Docker Deploy."
+            if product == "docker_deploy"
+            else f"Expected deployment_product=docker_deploy, got {product or 'missing'}.",
+            {"product": product},
+        )
+        _add_doctor_check(
+            checks,
+            "docker_deploy_host_id",
+            bool(host_id),
+            "Deployment is linked to a Docker Deploy appliance host."
+            if host_id
+            else "Deployment has no docker_deploy_host_id.",
+            {"docker_deploy_host_id": host_id},
+        )
+
+        doctor_host: dict[str, Any] | None = None
+        if isinstance(host_id, str) and host_id:
+            try:
+                host_raw = await client._transport.request(
+                    "GET", f"/api/v1/docker-deploy/hosts/{host_id}"
+                )
+                unwrapped_host = _unwrap(host_raw)
+                doctor_host = unwrapped_host if isinstance(unwrapped_host, dict) else None
+                status = doctor_host.get("status") if doctor_host else None
+                appliance_status = (
+                    doctor_host.get("appliance_status") if doctor_host else None
+                )
+                ok = (
+                    str(status or "") not in {"failed", "error", "destroyed"}
+                    and str(appliance_status or "") not in {"failed", "error", "unhealthy"}
+                )
+                _add_doctor_check(
+                    checks,
+                    "docker_deploy_host_health",
+                    ok,
+                    "Docker Deploy host is not reporting a failed state."
+                    if ok
+                    else (
+                        "Docker Deploy host is unhealthy: "
+                        f"status={status}, appliance_status={appliance_status}."
+                    ),
+                    {"status": status, "appliance_status": appliance_status},
+                )
+            except Exception as exc:
+                _add_doctor_check(
+                    checks,
+                    "docker_deploy_host_health",
+                    False,
+                    f"Could not fetch Docker Deploy host {host_id}: {exc}",
+                )
+
+        runtime_value = doctor_metadata.get("runtime")
+        runtime: dict[str, Any] = runtime_value if isinstance(runtime_value, dict) else {}
+        runtime_ip = runtime.get("ip") or runtime.get("ip_address")
+        runtime_port = runtime.get("port")
+        _add_doctor_check(
+            checks,
+            "route_runtime",
+            bool(runtime_ip) and runtime_port is not None,
+            "Deployment route metadata points at a runtime target."
+            if runtime_ip and runtime_port is not None
+            else "Deployment metadata has no runtime ip/port target.",
+            {"ip": runtime_ip, "port": runtime_port},
+        )
+
+        public_url = deployment.get("public_url") or doctor_metadata.get("public_url")
+        public_url = public_url if isinstance(public_url, str) else None
+        _add_doctor_check(
+            checks,
+            "public_url",
+            bool(public_url),
+            "Deployment has a public URL." if public_url else "Deployment has no public URL to probe.",
+            {"public_url": public_url},
+        )
+
+        probe_result: dict[str, Any] | None = None
+        if args.get("probe", True) is not False and public_url:
+            url = _public_probe_url(public_url, str(args.get("probe_path") or "/"))
+            try:
+                async with httpx.AsyncClient(
+                    timeout=float(args.get("timeout") or 20),
+                    follow_redirects=True,
+                ) as http:
+                    response = await http.get(url, headers={"Accept": "*/*"})
+                text = response.text
+                gateway_json = _looks_like_miosa_gateway_json(text)
+                ok = response.is_success and not gateway_json
+                probe_result = {
+                    "url": url,
+                    "status": response.status_code,
+                    "ok": ok,
+                    "response_snippet": text[:500],
+                    "gateway_json": gateway_json,
+                }
+                _add_doctor_check(
+                    checks,
+                    "public_url_probe",
+                    ok,
+                    f"Public URL returned HTTP {response.status_code}."
+                    if ok
+                    else (
+                        "Public URL returned MIOSA gateway JSON instead of the app."
+                        if gateway_json
+                        else f"Public URL returned HTTP {response.status_code}."
+                    ),
+                    {"status": response.status_code, "gateway_json": gateway_json},
+                )
+            except Exception as exc:
+                probe_result = {
+                    "url": url,
+                    "status": None,
+                    "ok": False,
+                    "response_snippet": str(exc),
+                }
+                _add_doctor_check(
+                    checks,
+                    "public_url_probe",
+                    False,
+                    f"Public URL probe failed: {exc}",
+                )
+
+        result = {
+            "ok": all(bool(check["ok"]) for check in checks),
+            "deployment_id": deployment_id,
+            "deployment": deployment,
+            "host": doctor_host,
+            "public_url": public_url,
+            "checks": checks,
+            "probe": probe_result,
+        }
+        return _ok(json.dumps(result, indent=2))
 
     if name == "deployment_delete":
         did = args["deployment_id"]
@@ -3153,7 +4155,7 @@ async def _dispatch(
             body["source"] = args["source"]
         raw = await client._transport.request("POST", f"/api/v1/deployments/{did}/publish", json_body=body)
         d = _unwrap(raw)
-        return _ok(f"Published deployment {did} (version id={d.get('id', 'unknown')})")
+        return _json_result({"deployment_id": did, "publish": d})
 
     if name == "deployment_rollback":
         did = args["deployment_id"]
@@ -3246,38 +4248,63 @@ async def _dispatch(
         if args.get("prefix"):
             obj_params["prefix"] = args["prefix"]
         raw = await client._transport.request("GET", f"/api/v1/storage/buckets/{bid}/objects", params=obj_params)
-        objects = _unwrap(raw)
-        if not objects:
+        # Backend returns `{data: {keys: [<str>], truncated: bool, next_marker}}`.
+        data = _unwrap(raw)
+        keys = data.get("keys", []) if isinstance(data, dict) else (data or [])
+        if not keys:
             return _ok("No objects found.")
         lines = ["Objects:"]
-        for o in objects:
-            lines.append(f"  {o.get('key')}  {o.get('size', '')}  {o.get('last_modified', '')}")
+        for k in keys:
+            # keys are plain strings; tolerate object shapes defensively.
+            lines.append(f"  {k.get('key') if isinstance(k, dict) else k}")
+        if isinstance(data, dict) and data.get("truncated"):
+            lines.append(f"  … (truncated; next_marker={data.get('next_marker')})")
         return _ok("\n".join(lines))
 
     if name == "storage_object_upload":
         bid = args["bucket_id"]
-        await client._transport.request(
-            "POST",
-            f"/api/v1/storage/buckets/{bid}/objects",
-            json_body={
-                "key": args["key"],
-                "content": args["content"],
-                "content_type": args.get("content_type", "application/octet-stream"),
-            },
+        key = args["key"].lstrip("/")
+        content = args["content"]
+        # Backend route: `PUT /storage/buckets/:id/objects/*key`. The handler
+        # reads the *raw request body* as the object payload. The platform's
+        # Plug.Parsers only passes `application/json` and
+        # `application/octet-stream`, so the body MUST be sent as octet-stream
+        # to avoid a 415 — regardless of the object's logical MIME type.
+        if args.get("content_encoding") == "base64":
+            object_body = base64.b64decode(content)
+        else:
+            object_body = content.encode("utf-8")
+        raw = await client._transport.request(
+            "PUT",
+            f"/api/v1/storage/buckets/{bid}/objects/{key}",
+            data=cast(Any, object_body),
+            headers={"Content-Type": "application/octet-stream"},
         )
-        return _ok(f"Uploaded {args['key']} to bucket {bid}.")
+        d = _unwrap(raw)
+        size = d.get("size") if isinstance(d, dict) else None
+        suffix = f" ({size} bytes)" if size is not None else ""
+        return _ok(f"Uploaded {key} to bucket {bid}{suffix}.")
 
     if name == "storage_object_download":
         bid = args["bucket_id"]
-        raw = await client._transport.request("GET", f"/api/v1/storage/buckets/{bid}/objects/{args['key']}")
+        key = args["key"].lstrip("/")
+        raw = await client._transport.request("GET", f"/api/v1/storage/buckets/{bid}/objects/{key}")
+        # Backend returns the raw object bytes (not a JSON envelope). Decode
+        # UTF-8 text where possible; fall back to base64 for binary payloads.
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                return _ok(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                return _ok(base64.b64encode(raw).decode("ascii"))
         d = _unwrap(raw)
         content = d.get("content", str(d)) if isinstance(d, dict) else str(d)
         return _ok(content)
 
     if name == "storage_object_delete":
         bid = args["bucket_id"]
-        await client._transport.request("DELETE", f"/api/v1/storage/buckets/{bid}/objects/{args['key']}")
-        return _ok(f"Deleted {args['key']} from bucket {bid}.")
+        key = args["key"].lstrip("/")
+        await client._transport.request("DELETE", f"/api/v1/storage/buckets/{bid}/objects/{key}")
+        return _ok(f"Deleted {key} from bucket {bid}.")
 
     if name == "storage_presign":
         bid = args["bucket_id"]
@@ -3551,6 +4578,8 @@ async def _dispatch(
             return _ok("No API keys found.")
         lines = ["API keys:"]
         for k in (keys if isinstance(keys, list) else [keys]):
+            if not isinstance(k, dict):
+                continue
             scopes_str = ", ".join(k.get("scopes", [])) if isinstance(k.get("scopes"), list) else str(k.get("scopes", ""))
             lines.append(f"  {k.get('id')}  {k.get('name')}  scopes=[{scopes_str}]")
         return _ok("\n".join(lines))
@@ -3576,10 +4605,12 @@ async def _dispatch(
     # ── Cron jobs ──────────────────────────────────────────────────────────
 
     if name == "cron_list":
-        params: dict[str, Any] = {}
+        cron_params: dict[str, Any] = {}
         if args.get("computer_id"):
-            params["computer_id"] = args["computer_id"]
-        raw = await client._transport.request("GET", "/api/v1/cron-jobs", params=params if params else None)
+            cron_params["computer_id"] = args["computer_id"]
+        raw = await client._transport.request(
+            "GET", "/api/v1/cron-jobs", params=cron_params or None
+        )
         jobs = _unwrap(raw)
         if not jobs:
             return _ok("No cron jobs found.")
@@ -3592,14 +4623,16 @@ async def _dispatch(
         return _ok("\n".join(lines))
 
     if name == "cron_create":
-        body: dict[str, Any] = {
+        cron_body: dict[str, Any] = {
             "computer_id": args["computer_id"],
             "schedule": args["schedule"],
             "command": args["command"],
         }
         if args.get("name"):
-            body["name"] = args["name"]
-        raw = await client._transport.request("POST", "/api/v1/cron-jobs", json_body=body)
+            cron_body["name"] = args["name"]
+        raw = await client._transport.request(
+            "POST", "/api/v1/cron-jobs", json_body=cron_body
+        )
         j = _unwrap(raw)
         j = j if isinstance(j, dict) else {}
         return _ok(f"Created cron job '{j.get('name', args.get('name', ''))}' (id={j.get('id')}).")
@@ -3689,12 +4722,14 @@ async def _dispatch(
 
     if name == "computer_template_create":
         wid = args["workspace_id"]
-        body: dict[str, Any] = {"name": args["name"]}
+        template_body: dict[str, Any] = {"name": args["name"]}
         for key in ("template_type", "size", "selected_apps", "settings"):
             if args.get(key) is not None:
-                body[key] = args[key]
+                template_body[key] = args[key]
         raw = await client._transport.request(
-            "POST", f"/api/v1/workspaces/{wid}/computer-templates", json_body=body
+            "POST",
+            f"/api/v1/workspaces/{wid}/computer-templates",
+            json_body=template_body,
         )
         t = _unwrap(raw)
         name_str = t.get("name", args["name"]) if isinstance(t, dict) else args["name"]
@@ -3848,7 +4883,17 @@ async def _run() -> None:
         stream=sys.stderr,
     )
 
-    async with AsyncMiosa(api_key=api_key) as client:
+    # Every tool dispatches against absolute `/api/v1/...` paths, so the client
+    # base_url must be the bare origin (no `/api/v1` suffix) — otherwise httpx
+    # joins them into a doubled `/api/v1/api/v1/...` path that 404s. Normalise
+    # the configured/default base_url accordingly.
+    base_url = os.environ.get("MIOSA_BASE_URL", "https://api.miosa.ai").rstrip("/")
+    if base_url.endswith("/api/v1"):
+        base_url = base_url[: -len("/api/v1")]
+
+    async with AsyncMiosa(api_key=api_key, base_url=base_url) as client:
+        tenant = os.environ.get("MIOSA_TENANT", "").strip()
+        _set_tenant_context(client, tenant or None)
         app = build_server(client)
         async with stdio_server() as (read_stream, write_stream):
             await app.run(
@@ -3860,6 +4905,20 @@ async def _run() -> None:
 
 def main() -> None:
     import asyncio
+    from importlib.metadata import PackageNotFoundError, version
+
+    if any(arg in {"--version", "-V", "version"} for arg in sys.argv[1:]):
+        try:
+            from miosa_mcp import __version__ as package_version
+        except Exception:
+            try:
+                package_version = version("miosa-mcp")
+            except PackageNotFoundError:
+                package_version = "unknown"
+
+        print(f"miosa-mcp {package_version}")
+        return
+
     asyncio.run(_run())
 
 
