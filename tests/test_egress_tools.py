@@ -12,8 +12,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from miosa_mcp.tools.egress import (
-    EGRESS_TOOLS,
-    dispatch_egress,
     _ALLOWLIST_PATH,
     _AUDIT_PATH,
     _OAUTH_PROVIDERS_PATH,
@@ -21,8 +19,9 @@ from miosa_mcp.tools.egress import (
     _POLICY_PATH,
     _SECRETS_PATH,
     _SUGGESTIONS_PATH,
+    EGRESS_TOOLS,
+    dispatch_egress,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -685,7 +684,7 @@ class TestServerDispatchIntegration:
     @pytest.mark.asyncio
     async def test_dispatch_routes_miosa_prefix_to_egress(self):
         """_dispatch hands miosa_* names off to dispatch_egress."""
-        from unittest.mock import patch, AsyncMock as AM
+        from unittest.mock import patch
 
         transport = _make_transport(**{
             f"GET:{_SECRETS_PATH}": {"data": [{"id": "s1", "name": "K"}]},
@@ -695,10 +694,8 @@ class TestServerDispatchIntegration:
 
         with patch(
             "miosa_mcp.server.dispatch_egress",
-            new_callable=lambda: lambda *a, **kw: AM(
-                return_value=[MagicMock(text="patched")]
-            )(),
-        ) as mock_dispatch:
+            new=AsyncMock(return_value=[MagicMock(text="patched")]),
+        ):
             # Import _dispatch from server
             from miosa_mcp.server import _dispatch
 

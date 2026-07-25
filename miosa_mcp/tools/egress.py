@@ -472,11 +472,14 @@ EGRESS_TOOLS: list[types.Tool] = [
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _ok(text: str) -> list[types.TextContent]:
+ToolContent = types.TextContent | types.ImageContent
+
+
+def _ok(text: str) -> list[ToolContent]:
     return [types.TextContent(type="text", text=text)]
 
 
-def _err(msg: str) -> list[types.TextContent]:
+def _err(msg: str) -> list[ToolContent]:
     return [types.TextContent(type="text", text=f"Error: {msg}")]
 
 
